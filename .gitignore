@@ -1,0 +1,18 @@
+node_modules/
+
+# Nothing here needs environment config — the planner has no database and no
+# secrets. This is a guard, not a requirement.
+.env
+.env.*
+
+*.log
+.DS_Store
+Thumbs.db
+
+# Real, UNSCRUBBED material summaries. The fixtures in test/ewp-fixtures/ have had
+# every company name, staff name, customer, address and phone number removed; a
+# raw export straight out of MiTek has none of that removed and must never be
+# committed. Keep real jobs outside the repo, or scrub them first.
+*-raw.csv
+*-unscrubbed.csv
+samples/

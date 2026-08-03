@@ -1,0 +1,257 @@
+// =============================================================
+// planner/server.js — the DB-FREE local entry point.
+// Run with: npm run planner   →  http://127.0.0.1:5178
+// =============================================================
+// A standalone purchase planner for a laptop (Linux or Windows 11). Drop in one
+// or more MiTek "Material Summary" CSVs, say how many distinct stock lengths
+// you're willing to order, and get back the length sets that minimize what you
+// have to buy.
+//
+// HARD CONSTRAINT — this file must never reach for a database. No `pg`, no
+// `dotenv`, no require of the app's ../../server.js. It shares the ENGINE with
+// the web app (one copy of optimizeCuts.js, no drift) and nothing else. It also
+// binds 127.0.0.1 only: this is a personal tool, not a LAN service, and the
+// app's own auth/session layer is not in play here.
+//
+// UPLOADS — the browser reads the CSVs with FileReader and POSTs them as JSON
+// text. That avoids a multipart parser (and a new npm dependency) entirely;
+// material summaries are a few KB of text. express.json's limit is the DoS
+// guard, mirroring the body-size reasoning in the main server.
+// =============================================================
+
+const express = require('express');
+const path = require('node:path');
+
+const { parseJobCsv } = require('../ewp/parseCsv.js');
+const { analyzeBatch, productsOf, splitBatch } = require('../ewp/selectStockLengths.js');
+const {
+  IJOIST_LENGTH_MENU, DEFAULT_PURCHASE_LENGTHS_BY_CAT, DEFAULT_LVL_DROP_MIN_FT,
+} = require('../ewp/optimizeCuts.js');
+
+const PORT = Number(process.env.PLANNER_PORT) || 5178;
+const HOST = '127.0.0.1';
+
+// How many ranked candidates to ship to the browser. The search can evaluate
+// ~969 sets at maxLengths:3; the buyer only ever looks at the head of that list,
+// and sending all of them is a slow response for no benefit.
+const RESULT_LIMIT = 25;
+
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+
+// Never let a browser cache this tool. Without it, /api/menu is a plain GET with
+// no Cache-Control and no Last-Modified, so a browser may heuristically reuse an
+// older response — which is exactly what happened when the menu payload changed
+// shape between restarts: the page kept a stale body, blew up reading a field
+// that no longer existed, and silently rendered an empty pool editor. A dev tool
+// on localhost has nothing to gain from caching.
+app.use((_req, res, next) => {
+  res.set('Cache-Control', 'no-store, max-age=0');
+  next();
+});
+
+// Deliberately NOT express.static(public/). Two reasons: the app's public/ has
+// its own index.html, which express.static would serve at "/" ahead of any
+// route here — you'd get the hanger app's dashboard firing DB calls at a server
+// that has no database. And planner.html is fully self-contained (inline CSS +
+// JS), so it lives next to this file rather than in the app's asset dir, where
+// the main server would otherwise publish a page whose /api/plan doesn't exist.
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'planner.html'));
+});
+
+// The cut-list diagrams, shared verbatim with the web app's /optimize.html so
+// the office reads the same picture in both places. Served as THREE EXPLICIT
+// ROUTES rather than a static mount of public/ — mounting it would also publish
+// index.html, optimize.html and the rest of an app this server cannot back.
+const SHARED_ASSETS = {
+  '/cutListModel.js': [path.join(__dirname, '..', 'ewp', 'cutListModel.js'), 'application/javascript'],
+  '/cutList.js': [path.join(__dirname, '..', '..', 'public', 'cutList.js'), 'application/javascript'],
+  '/cutList.css': [path.join(__dirname, '..', '..', 'public', 'cutList.css'), 'text/css'],
+};
+for (const [route, [file, type]] of Object.entries(SHARED_ASSETS)) {
+  app.get(route, (_req, res) => res.type(type).sendFile(file));
+}
+
+// Menu + defaults for the UI, read from the engine rather than re-typed here —
+// same single-source-of-truth rule server.js follows.
+app.get('/api/menu', (_req, res) => {
+  res.json({
+    ok: true,
+    lengthMenu: IJOIST_LENGTH_MENU,
+    supplierDefault: DEFAULT_PURCHASE_LENGTHS_BY_CAT['I-Joist'],
+    // Defaults for the LVL / Rim pools. These are SET by the user, not searched:
+    // the engine already opens the cheapest allowed length per board, so simply
+    // widening the list captures the benefit without any extra combinatorics.
+    byCat: {
+      LVL: DEFAULT_PURCHASE_LENGTHS_BY_CAT['LVL'],
+      RimBoard: DEFAULT_PURCHASE_LENGTHS_BY_CAT['RimBoard'],
+    },
+    lvlDropMinFt: DEFAULT_LVL_DROP_MIN_FT,
+  });
+});
+
+// Parse the uploaded CSVs once. Shared by /api/inspect and /api/plan so the two
+// never disagree about what is in a batch. parseJobCsv returns [] for a non-EWP
+// export, which is a user-facing mistake worth naming rather than silently
+// dropping.
+function readBatch(files) {
+  const jobs = [];
+  const rejected = [];
+  const cutItems = [];
+  for (const f of files) {
+    let items;
+    try {
+      items = parseJobCsv(String(f.text || ''));
+    } catch (err) {
+      rejected.push({ name: f.name, reason: `parse failed: ${err.message}` });
+      continue;
+    }
+    if (!items.length) {
+      rejected.push({ name: f.name, reason: 'not an EWP material summary (Product != "EWP")' });
+      continue;
+    }
+    const header = items.find((i) => i.kind === 'header') || {};
+    const materials = items.filter((i) => i.kind === 'material' && i.category !== 'Hanger');
+    if (!materials.length) {
+      rejected.push({ name: f.name, reason: 'no EWP cut material rows (hangers only?)' });
+      continue;
+    }
+    jobs.push({
+      file: f.name,
+      jobNumber: header.jobNumber || 'Unknown',
+      jobName: header.jobName || 'Unknown',
+      deliveryDate: header.deliveryDate || 'Unknown',
+      pieces: materials.reduce((s, m) => s + (m.qty || 0), 0),
+      categories: [...new Set(materials.map((m) => m.category))].sort(),
+    });
+    cutItems.push(...items);
+  }
+  return { jobs, rejected, cutItems };
+}
+
+// What products are in this batch? The pool editor can only be drawn once we know,
+// and parsing lives here — so the UI asks on drop, before planning anything. Parse
+// only, no packing: this returns in milliseconds.
+app.post('/api/inspect', (req, res) => {
+  const { files } = req.body || {};
+  if (!Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No CSV files were provided.' });
+  }
+  const { jobs, rejected, cutItems } = readBatch(files);
+  if (!cutItems.length) {
+    return res.status(400).json({ ok: false, error: 'No usable EWP job data found.', rejected });
+  }
+  const { ijoistItems } = splitBatch(cutItems);
+  res.json({
+    ok: true,
+    jobs,
+    rejected,
+    // One entry per I-Joist PRODUCT — each is an independent sourcing decision
+    // with its own supplier availability and its own length budget.
+    products: productsOf(ijoistItems).map((p) => ({
+      key: p.key, size: p.size, depth: p.depth, pieces: p.pieces, feet: p.feet,
+    })),
+  });
+});
+
+app.post('/api/plan', (req, res) => {
+  const {
+    files, maxLengths, menu, topN,
+    purchaseLengthsByCat, lvlDropMinFt, poolBySize, maxLengthsBySize,
+  } = req.body || {};
+
+  if (!Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No CSV files were provided.' });
+  }
+
+  const { jobs, rejected, cutItems } = readBatch(files);
+
+  if (!cutItems.length) {
+    return res.status(400).json({ ok: false, error: 'No usable EWP job data found.', rejected });
+  }
+
+  // Only the LVL / RimBoard pools are user-settable here. I-Joist sourcing is
+  // decided by the SEARCH (via `menu`), so letting it also arrive as a
+  // per-category override would give two competing answers for one question.
+  let byCat = null;
+  if (purchaseLengthsByCat && typeof purchaseLengthsByCat === 'object') {
+    byCat = {};
+    for (const cat of ['LVL', 'RimBoard']) {
+      const v = purchaseLengthsByCat[cat];
+      if (!Array.isArray(v)) continue;
+      const lens = v.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (!lens.length) {
+        return res.status(400).json({
+          ok: false, error: `${cat} must have at least one purchasable length.`,
+        });
+      }
+      byCat[cat] = lens;
+    }
+    if (!Object.keys(byCat).length) byCat = null;
+  }
+
+  // Per-product pools. An empty list is a real error worth naming — the UI should
+  // never send one, and if it does the buyer deserves to be told which product.
+  let pools = null;
+  if (poolBySize && typeof poolBySize === 'object') {
+    pools = {};
+    for (const [key, v] of Object.entries(poolBySize)) {
+      if (!Array.isArray(v)) continue;
+      const lens = v.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+      if (!lens.length) {
+        return res.status(400).json({
+          ok: false, error: `No purchasable lengths are ticked for "${key}".`,
+        });
+      }
+      pools[key] = lens;
+    }
+  }
+
+  const t0 = Date.now();
+  let result;
+  try {
+    result = analyzeBatch(cutItems, {
+      maxLengths: Number(maxLengths) || 3,
+      maxLengthsBySize: maxLengthsBySize && typeof maxLengthsBySize === 'object'
+        ? maxLengthsBySize : undefined,
+      menu: Array.isArray(menu) && menu.length ? menu.map(Number) : undefined,
+      poolBySize: pools,
+      // Finalists refined at full budget for the WINNING length count. Each one
+      // is a full engine run, so this is the main runtime dial: 3 still lets a
+      // different length set overtake the sweep's leader after refinement.
+      topN: Number(topN) || 3,
+      purchaseLengthsByCat: byCat,
+      lvlDropMinFt: Number.isFinite(Number(lvlDropMinFt)) ? Number(lvlDropMinFt) : undefined,
+    });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+
+  res.json({
+    ok: true,
+    jobs,
+    rejected,
+    ms: Date.now() - t0,
+    // One independent answer per I-Joist product…
+    products: result.products.map((p) => ({
+      ...p,
+      ranked: (p.ranked || []).slice(0, RESULT_LIMIT),
+      truncated: Math.max(0, (p.ranked || []).length - RESULT_LIMIT),
+    })),
+    // …and one order, one cut sheet, one set of totals across all of them.
+    totals: result.totals,
+    purchaseList: result.purchaseList,
+    cutPlan: result.cutPlan,
+    error: result.error,
+  });
+});
+
+if (require.main === module) {
+  app.listen(PORT, HOST, () => {
+    console.log(`EWP purchase planner  →  http://${HOST}:${PORT}`);
+    console.log('No database, no .env, localhost only. Ctrl-C to stop.');
+  });
+}
+
+module.exports = { app };
