@@ -78,13 +78,19 @@ src/planner/     server.js, planner.html   — the tool
 src/ewp/         optimizeCuts.js           — the packing engine
                  selectStockLengths.js     — the search over length sets
                  cutListModel.js           — board grouping (shared with the browser)
+                 inventoryImpact.js        — stock depletion report (not wired up yet)
                  parseCsv.js, extractDepth.js, normalizeSize.js, dbAdapters.js
 public/          cutList.js, cutList.css   — per-board cut diagrams
 test/            three suites; npm test
+docs/            inventory-feature-brief.md
 ```
 
 `optimizeCuts.js` and its helpers are ported from the hanger-web-app EWP engine. Keep them
 in step deliberately — the packing behaviour is regression-locked over there.
+
+Planning the on-hand-stock feature? Start with
+[`docs/inventory-feature-brief.md`](docs/inventory-feature-brief.md) — the engine is already
+inventory-aware and deliberately switched off, and the brief says where the seam is.
 
 ## Test fixtures are scrubbed
 
@@ -93,5 +99,11 @@ removed** — company name, staff names, customer businesses, street addresses, 
 and job names are replaced or blanked. Only the material rows (product, quantity, length,
 label), job numbers and dates are real, because those are what the tests assert on.
 
-**Never commit a raw MiTek export.** `.gitignore` guards `*-raw.csv` and `*-unscrubbed.csv`,
-but that is a safety net, not a substitute for checking.
+**Never commit a raw MiTek export.** `.gitignore` guards `*-raw.csv` and `*-unscrubbed.csv`
+and ignores `samples/` wholesale, but that is a safety net, not a substitute for checking.
+
+**Naming, for anything added from here on.** New job material CSVs take the
+**`-scrubbed.csv`** suffix (`34500J-materials-scrubbed.csv`) to mark them as reviewed and
+safe to commit. Wholly fabricated files take **`-synthetic.csv`** instead — real-but-cleaned
+and invented are different things and the filename should say which. The four fixtures above
+predate the convention and keep their names.
