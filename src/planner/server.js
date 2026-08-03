@@ -23,6 +23,8 @@ const express = require('express');
 const path = require('node:path');
 
 const { parseJobCsv } = require('../ewp/parseCsv.js');
+const { parseStockCsv, looksLikeStockCsv } = require('../ewp/readStockCsv.js');
+const { applyStock, coverageOf } = require('../ewp/applyStock.js');
 const { analyzeBatch, productsOf, splitBatch } = require('../ewp/selectStockLengths.js');
 const {
   IJOIST_LENGTH_MENU, DEFAULT_PURCHASE_LENGTHS_BY_CAT, DEFAULT_LVL_DROP_MIN_FT,
@@ -130,34 +132,97 @@ function readBatch(files) {
   return { jobs, rejected, cutItems };
 }
 
+// Sort the uploaded files into job summaries and the (single) stock list.
+//
+// The page has a drop zone for each, but a misfiled CSV is a two-second mistake
+// that would otherwise cost a confusing error — a stock file parsed as a job is
+// "not an EWP material summary", which says nothing useful. The two shapes are
+// unambiguous (a stock file's header carries item/span/qty; a MiTek summary's
+// does not), so sniff and re-file, and tell the caller it happened.
+function routeFiles(files, stockFile) {
+  const jobFiles = [];
+  const stockFiles = [];
+  const rerouted = [];
+
+  for (const f of files || []) {
+    if (looksLikeStockCsv(String(f.text || ''))) {
+      stockFiles.push(f);
+      rerouted.push({ name: f.name, to: 'stock' });
+    } else {
+      jobFiles.push(f);
+    }
+  }
+  if (stockFile && String(stockFile.text || '').trim()) {
+    if (looksLikeStockCsv(String(stockFile.text))) {
+      // An explicitly-dropped stock file wins over one sniffed out of the job pile.
+      stockFiles.unshift(stockFile);
+    } else {
+      jobFiles.push(stockFile);
+      rerouted.push({ name: stockFile.name, to: 'jobs' });
+    }
+  }
+  return { jobFiles, stockFile: stockFiles[0] || null, rerouted };
+}
+
+// Parse the stock CSV, if there is one. A malformed stock file is reported and
+// the plan still runs greenfield — losing the netting is annoying, but refusing
+// to plan at all because a second, optional input was wrong is worse.
+function readStock(file) {
+  if (!file) return { items: [], info: null };
+  try {
+    const r = parseStockCsv(String(file.text || ''));
+    return {
+      items: r.items,
+      info: {
+        name: file.name,
+        rows: r.rowCount,
+        qtyColumn: r.qtyColumn,
+        skipped: r.skipped.length,
+        warnings: r.warnings,
+      },
+    };
+  } catch (err) {
+    return { items: [], info: { name: file.name, error: err.message, rows: 0 } };
+  }
+}
+
 // What products are in this batch? The pool editor can only be drawn once we know,
 // and parsing lives here — so the UI asks on drop, before planning anything. Parse
 // only, no packing: this returns in milliseconds.
 app.post('/api/inspect', (req, res) => {
-  const { files } = req.body || {};
+  const { files, stock } = req.body || {};
   if (!Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ ok: false, error: 'No CSV files were provided.' });
   }
-  const { jobs, rejected, cutItems } = readBatch(files);
+  const routed = routeFiles(files, stock);
+  const { jobs, rejected, cutItems } = readBatch(routed.jobFiles);
   if (!cutItems.length) {
     return res.status(400).json({ ok: false, error: 'No usable EWP job data found.', rejected });
   }
   const { ijoistItems } = splitBatch(cutItems);
+  const stockRead = readStock(routed.stockFile);
   res.json({
     ok: true,
     jobs,
     rejected,
+    rerouted: routed.rerouted,
     // One entry per I-Joist PRODUCT — each is an independent sourcing decision
     // with its own supplier availability and its own length budget.
     products: productsOf(ijoistItems).map((p) => ({
       key: p.key, size: p.size, depth: p.depth, pieces: p.pieces, feet: p.feet,
     })),
+    stock: stockRead.info,
+    // Which materials the stock file actually mentions. Worth showing BEFORE a
+    // plan that takes ~40s: "this file says nothing about TJI® 560" is a
+    // different problem from "there are none on hand", and only one of them is
+    // fixed by exporting the stock list again.
+    coverage: stockRead.items.length ? coverageOf(cutItems, stockRead.items) : null,
   });
 });
 
 app.post('/api/plan', (req, res) => {
   const {
-    files, maxLengths, menu, topN,
+    files, stock, maxLengths, menu, topN,
     purchaseLengthsByCat, lvlDropMinFt, poolBySize, maxLengthsBySize,
   } = req.body || {};
 
@@ -165,7 +230,8 @@ app.post('/api/plan', (req, res) => {
     return res.status(400).json({ ok: false, error: 'No CSV files were provided.' });
   }
 
-  const { jobs, rejected, cutItems } = readBatch(files);
+  const routed = routeFiles(files, stock);
+  const { jobs, rejected, cutItems } = readBatch(routed.jobFiles);
 
   if (!cutItems.length) {
     return res.status(400).json({ ok: false, error: 'No usable EWP job data found.', rejected });
@@ -228,10 +294,33 @@ app.post('/api/plan', (req, res) => {
     return res.status(400).json({ ok: false, error: err.message });
   }
 
+  // ---- net the greenfield answer against the yard.
+  //
+  // Deliberately AFTER the search, never inside it: the search stays greenfield
+  // so its recommended lengths and the waste they're ranked on don't move with
+  // the stock snapshot. See the header of applyStock.js.
+  //
+  // With no stock file this stays null and every field above is byte-identical
+  // to what this endpoint returned before the feature existed.
+  const stockRead = readStock(routed.stockFile);
+  let stockView = null;
+  if (stockRead.items.length) {
+    try {
+      stockView = applyStock(cutItems, result, stockRead.items, {
+        purchaseLengthsByCat: byCat,
+        lvlDropMinFt: Number.isFinite(Number(lvlDropMinFt)) ? Number(lvlDropMinFt) : undefined,
+      });
+    } catch (err) {
+      // A failed netting must not throw away a plan that took ~40s to compute.
+      stockRead.info = { ...(stockRead.info || {}), error: `netting failed: ${err.message}` };
+    }
+  }
+
   res.json({
     ok: true,
     jobs,
     rejected,
+    rerouted: routed.rerouted,
     ms: Date.now() - t0,
     // One independent answer per I-Joist product…
     products: result.products.map((p) => ({
@@ -244,6 +333,9 @@ app.post('/api/plan', (req, res) => {
     purchaseList: result.purchaseList,
     cutPlan: result.cutPlan,
     error: result.error,
+    // …plus, when a stock list was dropped, what the yard covers of it.
+    stockInfo: stockRead.info,
+    stock: stockView,
   });
 });
 

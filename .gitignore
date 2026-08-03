@@ -16,3 +16,9 @@ Thumbs.db
 *-raw.csv
 *-unscrubbed.csv
 samples/
+
+# Working notes and the user guide — kept out of the public repo for now. Nothing in
+# here is needed to run or build the tool; the README carries everything a reader of
+# this repo needs. Anything referenced from committed files must therefore stand on
+# its own without them.
+docs/

@@ -9,10 +9,28 @@ npm run planner      # → http://127.0.0.1:5178
 
 Drop in one or more MiTek "Material Summary" CSVs, set how many distinct lengths you're
 willing to put on a PO, and it reports the lengths to buy, the quantities, and a per-board
-cut list.
+cut list. Add a stock list and it nets the order against what's already on the yard.
 
 **No database, no `.env`, no network at runtime.** It binds `127.0.0.1` only. Once
 `npm install` has run, it works fully disconnected.
+
+### Running it on Windows 11
+
+```powershell
+winget install OpenJS.NodeJS.LTS          # skip if `node -v` already prints v18+
+git clone https://github.com/williamsonbm/ewp-planner.git
+cd ewp-planner
+npm install                                # once. Needs internet; nothing after this does.
+npm run planner
+```
+
+Then open **http://127.0.0.1:5178** — it doesn't launch a browser for you. The PowerShell
+window *is* the server; Ctrl-C stops it. Next time, only the last two lines are needed.
+
+Clone over **HTTPS** as above unless you've already put an SSH key on that machine; or just
+download the ZIP from GitHub and unzip it — `npm install` and `npm run planner` work the same
+in the extracted folder. No firewall prompt should appear, because the server never listens
+on anything but loopback.
 
 ---
 
@@ -44,6 +62,30 @@ This distinction is not academic. Job `33844J` shows **144 ft of remainder** —
 it LVL drops, with the I-Joist plan an exact fit at **0 ft of waste**. Reporting raw
 remainder made a perfect plan look broken. If your shop does *not* reuse drops, raise the
 threshold in the UI and they reclassify as true waste.
+
+## Stock on hand — optional second CSV
+
+Drop a stock list in the second zone and the order is netted against the yard: the buy list
+gains **if bought new / covered by stock / buy**, and a new card shows what shipping the
+batch does to each stock line, flagging any that end below their reorder point.
+
+Any CSV with `item`, `span` and a quantity column works — columns are found by name, so a
+wide export (`item,span,depth,on_hand,committed,available,incoming,threshold,flag`) and a
+hand-written `item,span,qty,threshold` both load. Quantity comes from **`available`** (on
+hand minus committed) when the file has it, so boards already promised to another job aren't
+offered twice. `incoming` is ignored — it may not land before the job ships.
+
+**The length search itself stays stock-blind.** It answers "which lengths should I put on a
+PO", and that answer shouldn't move because the yard was full the week you asked. Stock is
+applied *after*, by re-packing the recommendation with the yard available — which is also
+why the cut sheet can use an on-hand 28′ board the supplier doesn't even sell.
+
+Both waste figures are shown: greenfield (the number the search ranked on, comparable
+between runs) and as-planned (what the batch really costs). Drawing an odd on-hand length
+often trades a little waste for a lot less spend, and that trade should be visible.
+
+Below-threshold lines are **flagged, never ordered**. Restocking the yard and covering these
+jobs are separate decisions.
 
 ## Pools are per PRODUCT, not per depth
 
@@ -77,20 +119,24 @@ enough to be worth asking the supplier for?"*
 src/planner/     server.js, planner.html   — the tool
 src/ewp/         optimizeCuts.js           — the packing engine
                  selectStockLengths.js     — the search over length sets
+                 applyStock.js             — nets the plan against on-hand stock
+                 readStockCsv.js           — stock CSV → engine inventory items
                  cutListModel.js           — board grouping (shared with the browser)
-                 inventoryImpact.js        — stock depletion report (not wired up yet)
+                 inventoryImpact.js        — stock depletion report
                  parseCsv.js, extractDepth.js, normalizeSize.js, dbAdapters.js
 public/          cutList.js, cutList.css   — per-board cut diagrams
-test/            three suites; npm test
-docs/            inventory-feature-brief.md
+test/            four suites; npm test
 ```
 
 `optimizeCuts.js` and its helpers are ported from the hanger-web-app EWP engine. Keep them
 in step deliberately — the packing behaviour is regression-locked over there.
 
-Planning the on-hand-stock feature? Start with
-[`docs/inventory-feature-brief.md`](docs/inventory-feature-brief.md) — the engine is already
-inventory-aware and deliberately switched off, and the brief says where the seam is.
+Two rules to know before touching the stock path. **The length search stays greenfield** —
+stock is applied to the lengths it already chose, never fed into the ranking, or reported
+waste becomes stock-dependent and two runs a week apart stop being comparable. And **real
+stock is merged *with* the zero-qty inventory stubs, never substituted for them** — a size
+with no stock row at all trips the engine's `no_inventory_match` pre-flight. Both are
+commented at length in [`src/ewp/applyStock.js`](src/ewp/applyStock.js).
 
 ## Test fixtures are scrubbed
 

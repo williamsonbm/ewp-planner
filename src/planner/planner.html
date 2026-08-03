@@ -36,10 +36,16 @@
   .sub { color:var(--muted); margin:0 0 20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
           padding:16px; margin-bottom:16px; }
-  #drop { border:2px dashed var(--line); border-radius:10px; padding:32px; text-align:center;
-          color:var(--muted); cursor:pointer; transition:border-color .15s, background .15s; }
-  #drop.over { border-color:var(--accent); background:var(--info-bg); }
-  #drop strong { color:var(--ink); }
+  #drop, #stockdrop { border:2px dashed var(--line); border-radius:10px; padding:32px;
+          text-align:center; color:var(--muted); cursor:pointer;
+          transition:border-color .15s, background .15s; }
+  #stockdrop { padding:18px; }
+  #drop.over, #stockdrop.over { border-color:var(--accent); background:var(--info-bg); }
+  #drop strong, #stockdrop strong { color:var(--ink); }
+  /* A stock line that ends the batch below its reorder point. Same warm palette
+     as .note, so "needs attention" reads the same everywhere on the page. */
+  tr.low td { background:var(--warn-bg); color:var(--warn); }
+  td.zero { color:var(--muted); }
   .files { list-style:none; padding:0; margin:12px 0 0; }
   .files li { display:flex; justify-content:space-between; gap:12px; padding:6px 0;
               border-bottom:1px solid var(--line); }
@@ -102,8 +108,10 @@
 <body>
 <div class="wrap">
   <h1>EWP Purchase Planner</h1>
-  <p class="sub">Drop in one or more MiTek material summaries. Assumes <strong>no stock on hand</strong> &mdash;
-     every piece is priced as a purchase. The search picks <strong>I-Joist</strong> lengths;
+  <p class="sub">Drop in one or more MiTek material summaries. The length search assumes
+     <strong>no stock on hand</strong> &mdash; every piece is priced as a purchase &mdash; so the
+     lengths it recommends mean the same thing week to week. Add a stock list and it also nets
+     the order against the yard. The search picks <strong>I-Joist</strong> lengths;
      LVL and Rim Board lengths are set by you, not searched.</p>
 
   <div class="card">
@@ -113,6 +121,16 @@
       <input type="file" id="file" accept=".csv,text/csv" multiple hidden>
     </div>
     <ul class="files" id="filelist"></ul>
+  </div>
+
+  <div class="card">
+    <div id="stockdrop">
+      <strong>Stock on hand</strong> &mdash; optional<br>
+      <span class="hint">one CSV with <code>item</code>, <code>span</code> and a quantity column.
+        Uses <code>available</code> (on hand minus committed) when it&rsquo;s there.</span>
+      <input type="file" id="stockfile" accept=".csv,text/csv" hidden>
+    </div>
+    <ul class="files" id="stocklist"></ul>
   </div>
 
   <div class="card">
@@ -144,11 +162,16 @@
 const drop = document.getElementById('drop');
 const fileInput = document.getElementById('file');
 const filelist = document.getElementById('filelist');
+const stockdrop = document.getElementById('stockdrop');
+const stockInput = document.getElementById('stockfile');
+const stocklist = document.getElementById('stocklist');
 const go = document.getElementById('go');
 const out = document.getElementById('out');
 const poolbox = document.getElementById('poolbox');
 
 let files = [];        // [{name, text}]
+let stockFile = null;  // {name, text} — ONE yard snapshot, not a list
+let STOCK = null;      // /api/inspect — what the server made of that file
 let MENU = null;       // /api/menu
 let PRODUCTS = [];     // /api/inspect — one entry per I-Joist product in the batch
 let LAST = null;       // last /api/plan response, kept so sorting needn't re-plan
@@ -248,21 +271,79 @@ filelist.addEventListener('click', (e) => {
   if (b) { files.splice(Number(b.dataset.i), 1); renderFiles(); inspect(); }
 });
 
+// ---- the yard snapshot -----------------------------------------------------
+// One file, replaced rather than appended: this is "what is on hand right now",
+// and two of those would just be a question about which is current.
+function renderStock() {
+  if (!stockFile) { stocklist.innerHTML = ''; return; }
+  const s = STOCK || {};
+  let detail;
+  if (s.error) detail = `<span style="color:var(--warn)">${esc(s.error)}</span>`;
+  else if (s.rows != null) {
+    detail = `${s.rows} row${s.rows === 1 ? '' : 's'}` +
+      (s.qtyColumn ? ` &middot; quantity from <code>${esc(s.qtyColumn)}</code>` : '') +
+      (s.skipped ? ` &middot; ${s.skipped} skipped` : '');
+  } else detail = files.length ? 'reading&hellip;'
+    : 'waiting for a material summary &mdash; the stock list is read against a batch';
+  stocklist.innerHTML =
+    `<li><span>${esc(stockFile.name)}<br><span class="hint">${detail}</span></span>` +
+    '<button class="rm" id="rmstock" title="remove">&times;</button></li>' +
+    coverageNote();
+}
+
+// Name the products the stock file says NOTHING about. That is not the same as
+// "none on hand" — it usually means the export didn't cover that series — and
+// it is much cheaper to learn now than after a 40-second plan.
+function coverageNote() {
+  const cov = (STOCK && STOCK.coverage) || null;
+  if (!cov) return '';
+  const missing = cov.filter((c) => !c.inStockFile);
+  if (!missing.length) return '';
+  return '<li><span class="hint">Not mentioned in this stock file: <strong>' +
+    missing.map((c) => esc(c.size)).join('</strong>, <strong>') +
+    '</strong> &mdash; planned as a full purchase.</span></li>';
+}
+
+stocklist.addEventListener('click', (e) => {
+  if (e.target.closest('#rmstock')) { stockFile = null; STOCK = null; renderStock(); inspect(); }
+});
+
 // Ask the server what products are in the batch as soon as the files change —
 // the pool editor cannot be drawn without that, and parsing is server-side.
 // Parse only, no packing, so this is effectively instant.
 async function inspect() {
-  if (!files.length) { PRODUCTS = []; renderPools(); return; }
+  if (!files.length) { PRODUCTS = []; STOCK = null; renderPools(); renderStock(); return; }
   try {
     const r = await (await fetch('/api/inspect', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      cache: 'no-store', body: JSON.stringify({ files }),
+      cache: 'no-store', body: JSON.stringify({ files, stock: stockFile }),
     })).json();
     if (!r.ok) { PRODUCTS = []; renderPools(); return; }
     PRODUCTS = r.products;
+    STOCK = r.stock ? { ...r.stock, coverage: r.coverage } : null;
+    // The server sniffs each file's header, so a stock list dropped in the jobs
+    // zone still lands in the right pile. Reflect that back in the UI rather
+    // than leaving the file sitting visibly in the wrong list.
+    if (r.rerouted && r.rerouted.length) applyReroute(r.rerouted);
     renderPools();
+    renderStock();
     document.getElementById('poolsBox').open = PRODUCTS.length > 1;
   } catch { /* the plan request will surface any real problem */ }
+}
+
+function applyReroute(rerouted) {
+  for (const x of rerouted) {
+    if (x.to === 'stock') {
+      const i = files.findIndex((f) => f.name === x.name);
+      if (i !== -1) { stockFile = files[i]; files.splice(i, 1); }
+    } else if (x.to === 'jobs') {
+      if (stockFile && stockFile.name === x.name) {
+        if (!files.some((f) => f.name === x.name)) files.push(stockFile);
+        stockFile = null;
+      }
+    }
+  }
+  renderFiles();
 }
 
 async function addFiles(list) {
@@ -274,13 +355,27 @@ async function addFiles(list) {
   renderFiles();
   await inspect();
 }
+
+async function setStock(list) {
+  const f = [...list].find((x) => /\.csv$/i.test(x.name));
+  if (!f) return;
+  stockFile = { name: f.name, text: await f.text() };
+  STOCK = null;
+  renderStock();
+  await inspect();
+}
+
 drop.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
-['dragenter','dragover'].forEach((ev) =>
-  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
-['dragleave','drop'].forEach((ev) =>
-  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
-drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
+stockdrop.addEventListener('click', () => stockInput.click());
+stockInput.addEventListener('change', () => { setStock(stockInput.files); stockInput.value = ''; });
+[[drop, addFiles], [stockdrop, setStock]].forEach(([el, handler]) => {
+  ['dragenter','dragover'].forEach((ev) =>
+    el.addEventListener(ev, (e) => { e.preventDefault(); el.classList.add('over'); }));
+  ['dragleave','drop'].forEach((ev) =>
+    el.addEventListener(ev, (e) => { e.preventDefault(); el.classList.remove('over'); }));
+  el.addEventListener('drop', (e) => handler(e.dataTransfer.files));
+});
 
 // ---- how long will this take? ----------------------------------------------
 // The old estimate ignored the LENGTH POOL entirely, so ticking "all" — which
@@ -380,6 +475,7 @@ go.addEventListener('click', async () => {
 
   const body = {
     files,
+    stock: stockFile,
     maxLengths: nMax,
     lvlDropMinFt: Number(document.getElementById('dropmin').value) || MENU.lvlDropMinFt,
     poolBySize,
@@ -422,10 +518,13 @@ go.addEventListener('click', async () => {
 // third back to the natural order (category, size, then longest length first).
 // Purely client-side over the fetched list — sorting never re-plans anything.
 let SORT = { col: null, dir: 0 };
+// `qty` on the greenfield buy list, `buy` on the netted one — sort the column
+// the table is actually showing.
+const pieceCount = (p) => (p.qty != null ? p.qty : p.buy);
 const SORT_KEYS = {
   length: (p) => p.stockLength,
-  pieces: (p) => p.qty,
-  feet: (p) => p.stockLength * p.qty,
+  pieces: pieceCount,
+  feet: (p) => p.stockLength * pieceCount(p),
 };
 
 function cycleSort(col) {
@@ -491,6 +590,12 @@ function view(r) {
   if (!r.totals) return h;
 
   const t = r.totals;
+  const stock = r.stock || null;
+
+  if (r.stockInfo && r.stockInfo.error) {
+    h += `<div class="card note"><strong>Stock list not applied.</strong><br>${esc(r.stockInfo.error)}` +
+      '<br>The plan below prices every piece as a purchase.</div>';
+  }
 
   // --- the whole order at a glance
   h += '<div class="card"><span class="pill">This order</span>' +
@@ -499,9 +604,54 @@ function view(r) {
     `<span class="stat drops"><b>${fmt(t.recoverableDrops)} ft</b><span>drops back to stock</span></span>` +
     `<span class="stat"><b>${t.boardsPurchased}</b><span>pieces to buy</span></span>` +
     `<span class="stat"><b>${fmt(t.feetPurchased)} ft</b><span>total purchased</span></span>` +
-    '</div></div>';
+    '</div>';
+  if (stock) {
+    // Both figures, side by side and labelled. The greenfield number is what
+    // the search RANKED on and what stays comparable between runs; as-planned is
+    // what this batch actually costs now that the yard is in play. Drawing an
+    // odd on-hand length routinely trades a little waste for a lot less spend,
+    // and that trade should be visible rather than quietly folded into one
+    // number.
+    const a = stock.totals.asPlanned;
+    h += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">' +
+      '<span class="pill">With stock on hand</span><div style="margin-top:14px">' +
+      `<span class="stat"><b>${fmt(a.trueWaste)} ft</b><span>true waste as planned</span></span>` +
+      `<span class="stat"><b>${a.boardsPurchased}</b><span>pieces still to buy</span></span>` +
+      `<span class="stat"><b>${fmt(a.feetPurchased)} ft</b><span>purchased</span></span>` +
+      `<span class="stat"><b>${stock.totals.boardsFromStock}</b><span>pieces from the yard</span></span>` +
+      `<span class="stat"><b>${fmt(stock.totals.feetFromStock)} ft</b><span>from the yard</span></span>` +
+      '</div><p class="muted" style="margin:12px 0 0;font-size:12px">' +
+      'The length search above is deliberately stock-blind, so its recommendation and its waste ' +
+      'figure mean the same thing next week. These numbers re-pack that same recommendation ' +
+      'against the yard.</p></div>';
+  }
+  h += '</div>';
 
   // --- the deliverable
+  if (stock) {
+    const list = sortedBuyList(stock.buyList);
+    const need = stock.buyList.reduce((s, p) => s + p.need, 0);
+    const buy = stock.buyList.reduce((s, p) => s + p.buy, 0);
+    h += '<div class="card"><h2>Order this <span class="hint">&mdash; netted against stock on hand. ' +
+      'Click a column to sort.</span></h2>' +
+      '<div class="tablewrap"><table>' +
+      '<tr><th>Category</th><th>Size</th>' + sortTh('length', 'Length') +
+      '<th class="num">If bought new</th><th class="num">Covered by stock</th>' +
+      sortTh('pieces', 'Buy') + sortTh('feet', 'Feet to buy') + '</tr>' +
+      list.map((p) => `<tr><td>${esc(p.category)}</td><td>${esc(p.size)}</td>` +
+        `<td class="num">${p.stockLength}&prime;</td>` +
+        `<td class="num">${p.need}</td><td class="num">${p.covered}</td>` +
+        `<td class="num${p.buy === 0 ? ' zero' : ''}">${p.buy}</td>` +
+        `<td class="num${p.buy === 0 ? ' zero' : ''}">${fmt(p.stockLength * p.buy)}</td></tr>`).join('') +
+      `<tr class="win"><td colspan="3">Total</td><td class="num">${need}</td>` +
+      `<td class="num">${need - buy}</td><td class="num">${buy} pieces</td>` +
+      `<td class="num">${fmt(stock.totals.asPlanned.feetPurchased)} ft</td></tr>` +
+      '</table></div>' +
+      '<p class="muted" style="margin:10px 0 0;font-size:12px">' +
+      '&ldquo;Covered by stock&rdquo; is the difference between the two plans, not a count of ' +
+      'boards drawn &mdash; on-hand pieces at other lengths absorb cuts, so the leftovers can ' +
+      'repack differently. The yard table below has the exact draws.</p>';
+  } else {
   const list = sortedBuyList(r.purchaseList);
   const totalPieces = r.purchaseList.reduce((s, p) => s + p.qty, 0);
   h += '<div class="card"><h2>Order this <span class="hint">&mdash; every length and how many, all jobs combined. ' +
@@ -515,6 +665,7 @@ function view(r) {
     `<tr class="win"><td colspan="3">Total</td><td class="num">${totalPieces} pieces</td>` +
     `<td class="num">${fmt(t.feetPurchased)} ft</td></tr>` +
     '</table></div>';
+  }
   h += '<div class="tablewrap" style="margin-top:12px"><table>' +
     '<tr><th>Category</th><th class="num">Boards</th><th class="num">Feet</th>' +
     '<th class="num">True waste</th><th class="num">Drops to stock</th></tr>' +
@@ -522,6 +673,38 @@ function view(r) {
       `<tr><td>${esc(cat)}</td><td class="num">${c.boards}</td><td class="num">${fmt(c.feet)}</td>` +
       `<td class="num">${fmt(c.waste)}</td><td class="num">${fmt(c.drops)}</td></tr>`).join('') +
     '</table></div></div>';
+
+  // --- what shipping this batch does to the yard
+  if (stock) {
+    h += '<div class="card"><h2>What this does to your yard ' +
+      '<span class="hint">&mdash; one row per stock line these jobs actually draw from</span></h2>';
+    if (!stock.depletion.length) {
+      h += '<p class="muted">Nothing was drawn from stock &mdash; no on-hand length fits any ' +
+        'piece in this batch.</p>';
+    } else {
+      h += '<div class="tablewrap"><table>' +
+        '<tr><th>Item</th><th class="num">Length</th><th class="num">On hand</th>' +
+        '<th class="num">Used</th><th class="num">Left</th><th class="num">Reorder at</th></tr>' +
+        stock.depletion.map((d) =>
+          `<tr class="${d.belowThreshold ? 'low' : ''}"><td>${esc(d.item)}</td>` +
+          `<td class="num">${d.stockLength}&prime;</td><td class="num">${d.startQty}</td>` +
+          `<td class="num">${d.used}</td><td class="num">${d.remaining}</td>` +
+          `<td class="num">${d.threshold == null ? '&mdash;' : d.threshold}</td></tr>`).join('') +
+        '</table></div>';
+      // Thresholds are a SIGNAL, never an addition to the order: restocking the
+      // yard and covering these jobs are two different decisions, and folding
+      // them together would inflate every waste and feet figure on this page
+      // with material no job asked for.
+      const low = stock.depletion.filter((d) => d.belowThreshold);
+      if (low.length) {
+        h += '<p class="note" style="margin:12px 0 0">' +
+          `${low.length} stock line${low.length === 1 ? '' : 's'} end${low.length === 1 ? 's' : ''} ` +
+          'this batch below the reorder point. Nothing has been added to the order above &mdash; ' +
+          'restocking is a separate call.</p>';
+      }
+    }
+    h += '</div>';
+  }
 
   // --- one section per product: each is an independent purchasing decision
   for (const p of r.products) {
@@ -569,9 +752,15 @@ function view(r) {
     esc,
     ftLabel: (n) => (n == null || n === '' ? '—' : `${(Math.round(Number(n) * 100) / 100)}′`),
   });
+  // With stock loaded, show the plan the shop will ACTUALLY cut — the second
+  // pass's boards, badged on-hand or purchase by the shared renderer. Showing
+  // the greenfield sheet next to a netted buy list would have the two halves of
+  // the page disagree about the same batch.
+  const sheet = stock ? stock.cutPlan : r.cutPlan;
   h += '<div class="card"><h2>Cut list <span class="hint">&mdash; per-board diagrams, grouped by job &amp; material; ' +
-    'identical boards collapse to ×N</span></h2>' + CutList.legend() +
-    r.cutPlan.map((j) => CutList.renderJob({
+    'identical boards collapse to ×N' + (stock ? '; on-hand boards are marked' : '') + '</span></h2>' +
+    CutList.legend() +
+    sheet.map((j) => CutList.renderJob({
       jobNumber: j.jobNumber, jobName: j.jobName, deliveryDate: j.deliveryDate,
       // The shared renderer speaks committed-row field names; buildCutPlan emits
       // the engine's. Translate here rather than renaming either side.

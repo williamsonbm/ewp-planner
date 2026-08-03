@@ -250,4 +250,8 @@ function parseCsv(text) {
   return rows;
 }
 
-module.exports = { parseJobCsv };
+// parseCsv (the row splitter) is exported for readStockCsv.js. The stock CSV
+// carries the same booby-trapped item strings as a material summary —
+// `"11 7/8"" PJI-40"` — so it needs quote-aware splitting too, and a second
+// implementation would be a second thing to get wrong.
+module.exports = { parseJobCsv, parseCsv };

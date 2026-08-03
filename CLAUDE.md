@@ -6,7 +6,7 @@ what you have to buy.
 
 ```
 npm install && npm run planner    # → http://127.0.0.1:5178
-npm test                          # → 73 tests, node:test, no framework
+npm test                          # → 94 tests, node:test, no framework
 ```
 
 ## Hard constraints — do not break these
@@ -35,8 +35,17 @@ them only deliberately; silent drift between the two copies causes real bugs.
 
 ## Working on on-hand stock / inventory?
 
-Read [`docs/inventory-feature-brief.md`](docs/inventory-feature-brief.md) first.
+If `docs/inventory-feature-brief.md` exists in your checkout, read it first — it explains the
+design and the landmines. That folder is gitignored, so it is not in a fresh clone; the
+summary below is self-contained. The feature is **built**; the shape of it is:
 
-Short version: the engine **already** accepts on-hand inventory items and is switched off by
-`greenfieldStubs()` in `src/ewp/selectStockLengths.js`. Don't write a solver — feed the one
-that's there, and read the brief's landmine section before touching those stubs.
+- `src/ewp/readStockCsv.js` — stock CSV → engine inventory items. Columns are found by
+  header name, so both the wide export (`available`) and a hand-written
+  `item,span,qty,threshold` load. Quantity comes from `available` (on hand minus committed).
+- `src/ewp/applyStock.js` — the second engine pass. **The length search stays greenfield**:
+  stock is applied to the lengths it already chose, never fed into the ranking. Change that
+  and reported waste becomes stock-dependent, so two runs a week apart stop being comparable.
+- Two rules worth not rediscovering: merge real stock **with** the zero-qty stubs (never
+  substitute, or a size with no stock row trips `no_inventory_match`), and
+  `stockPieceNumber` restarts at 0 in every `optimizeCuts` call, so `inventoryImpact` must be
+  called once per pass, never over concatenated passes.
